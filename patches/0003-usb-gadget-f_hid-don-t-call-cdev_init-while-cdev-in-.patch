@@ -1,0 +1,117 @@
+From ac16cd9be5c1a9f7753deaa67ff808f13b1eb8ec Mon Sep 17 00:00:00 2001
+From: JakeStone <208141191+JakeStone594@users.noreply.github.com>
+Date: Sun, 23 Aug 2026 00:59:27 +0300
+Subject: [PATCH] usb: gadget: f_hid: don't call cdev_init while cdev in use
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Backport of upstream 81ebd43cc0d6d "usb: gadget: f_hid: don't call
+cdev_init while cdev in use" (Michael Zimmermann, 2026-03-27), plus its
+follow-up "usb: gadget: f_hid: Add missing error code" (Ethan Tidmore,
+2026-04-02) which supplies the -ENOMEM. CVE-2026-31606, CVSS 3.1 5.5
+AV:L/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:H.
+
+struct cdev is embedded in struct f_hidg, and hidg_bind() called
+cdev_init() on it every bind. cdev_init() is memset(cdev, 0, sizeof *cdev)
+followed by kobject_init() (fs/char_dev.c:657-663), so a rebind wipes a
+kobject that an open fd is still holding a reference to and resets its
+refcount to 1.
+
+That an open fd holds such a reference is exactly the property commit
+7b96ece4a relies on: chrdev_open() -> cdev_get() ->
+kobject_get_unless_zero(&p->kobj) (fs/char_dev.c:364), and
+cdev_device_del() -> cdev_del() only kobject_put()s (:600-604) without
+freeing or invalidating open fds. So the two interact: the object v6
+keeps alive across the unbind is the object whose reference state the
+rebind destroys.
+
+Put the cdev on the heap with cdev_alloc() so each bind gets a fresh one.
+cdev_alloc() (fs/char_dev.c:639-647) uses ktype_cdev_dynamic, whose
+release (:616-624) does cdev_purge(), kfree(p) and kobject_put(parent) —
+so the old cdev frees itself at last close and correctly drops its
+reference on hidg->dev.
+
+f_hidg_open() can no longer container_of() the embedded member, so it
+recovers hidg through the cdev's parent kobject, which cdev_device_add()
+sets via cdev_set_parent(cdev, &dev->kobj) (:548). Upstream's form.
+
+Deviations from upstream, both forced by this tree: the error label is
+fail_free_descs rather than fail_free_all, and hidg_unbind() has no
+destroy_workqueue() — neither exists at 4.14.190.
+
+NOT diverging from a known upstream behaviour: if cdev_device_add() fails
+inside cdev_add(), the heap cdev is not freed. That leak is present in
+mainline too and only reachable on an allocation/registration failure
+path; matching upstream is safer for a backport than inventing a fix.
+
+⚠ This device cannot verify the fix at runtime. CONFIG_DEBUG_LIST is its
+only relevant detector and it does not cover this path; SLUB_DEBUG and
+DEBUG_OBJECTS are both unset. The damage this prevents — a silently
+replaced refcount and kobj.parent — produces no WARN, no poison and no
+list check. A clean on-device run therefore evidences CVE-2026-31721
+being fixed and says nothing whatever about this one. Correctness here
+rests on source review against upstream, not on a device checkpoint.
+
+Verified: compiles rc=0 with zero warnings (positive control on the log:
+the CC line for this TU is present in the same capture); .text differs
+from the patch-1 object; no &hidg->cdev address-of survives; cdev_init
+has 0 call sites where cdev_device_add still has 1, so the zero is
+absence rather than a broken probe.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013ydNrFirMZjskYMZST87ez
+---
+ drivers/usb/gadget/function/f_hid.c | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/usb/gadget/function/f_hid.c b/drivers/usb/gadget/function/f_hid.c
+index f544d1d8d..e0a87225e 100644
+--- a/drivers/usb/gadget/function/f_hid.c
++++ b/drivers/usb/gadget/function/f_hid.c
+@@ -62,7 +62,7 @@ struct f_hidg {
+ 	struct usb_request		*req;
+ 
+ 	struct device			dev;
+-	struct cdev			cdev;
++	struct cdev			*cdev;
+ 	struct usb_function		func;
+ 
+ 	struct usb_ep			*in_ep;
+@@ -453,8 +453,9 @@ static int f_hidg_release(struct inode *inode, struct file *fd)
+ 
+ static int f_hidg_open(struct inode *inode, struct file *fd)
+ {
++	struct kobject *parent = inode->i_cdev->kobj.parent;
+ 	struct f_hidg *hidg =
+-		container_of(inode->i_cdev, struct f_hidg, cdev);
++		container_of(parent, struct f_hidg, dev.kobj);
+ 
+ 	fd->private_data = hidg;
+ 
+@@ -829,8 +830,14 @@ static int hidg_bind(struct usb_configuration *c, struct usb_function *f)
+ 	spin_unlock_irqrestore(&hidg->write_spinlock, flags);
+ 
+ 	/* create char device */
+-	cdev_init(&hidg->cdev, &f_hidg_fops);
+-	status = cdev_device_add(&hidg->cdev, &hidg->dev);
++	hidg->cdev = cdev_alloc();
++	if (!hidg->cdev) {
++		status = -ENOMEM;
++		goto fail_free_descs;
++	}
++	hidg->cdev->ops = &f_hidg_fops;
++
++	status = cdev_device_add(hidg->cdev, &hidg->dev);
+ 	if (status)
+ 		goto fail_free_descs;
+ 
+@@ -1073,7 +1080,7 @@ static void hidg_unbind(struct usb_configuration *c, struct usb_function *f)
+ {
+ 	struct f_hidg *hidg = func_to_hidg(f);
+ 
+-	cdev_device_del(&hidg->cdev, &hidg->dev);
++	cdev_device_del(hidg->cdev, &hidg->dev);
+ 
+ 	usb_free_all_descriptors(f);
+ }

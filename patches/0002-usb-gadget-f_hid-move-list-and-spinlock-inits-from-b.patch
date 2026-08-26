@@ -1,0 +1,104 @@
+From 298452458b04cbe5a725ed1083201b1f25fcce8f Mon Sep 17 00:00:00 2001
+From: JakeStone <208141191+JakeStone594@users.noreply.github.com>
+Date: Sun, 23 Aug 2026 00:59:05 +0300
+Subject: [PATCH] usb: gadget: f_hid: move list and spinlock inits from bind to
+ alloc
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Backport of upstream "usb: gadget: f_hid: move list and spinlock inits
+from bind to alloc" (Michael Zimmermann, 2026-03-31). CVE-2026-31721,
+CVSS 3.1 5.5 AV:L/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:H — availability only,
+a local DoS, NOT privilege escalation as some vendor advisories title it.
+
+hidg_bind() re-initialised state that belongs to the lifetime of the
+gadget function, not of a bind: two spinlocks, two wait queue heads and
+one list head. init_waitqueue_head() resets the head's task_list to
+self-pointing, so a poll/select waiter registered before a UDC unbind
+is silently orphaned across the rebind; its poll_freewait() ->
+remove_wait_queue() -> list_del() then walks a head that no longer
+references the entry.
+
+Reproduced on this device on v6 (2026-08-23): 3x "list_del corruption"
+via __list_del_entry_valid+0xa8 <- remove_wait_queue+0x28 <-
+poll_freewait+0x38 <- do_select. Non-fatal only because commit 7b96ece4a
+keeps the struct alive, so the walk hits valid memory and
+__list_del_entry_valid declines the delete. On v5 the same walk hit
+freed slab and reset the phone.
+
+Note CONFIG_DEBUG_LIST=y is the only reason this is observable here:
+SLUB_DEBUG and DEBUG_OBJECTS are both unset. Taint cannot detect it —
+bit 9 (W) is already set by a boot-time rcu WARN, so any taint-keyed
+health check is blind to every WARN after the first of a boot.
+
+Scope differs from upstream, and the difference is real rather than a
+judgement call: upstream moves nine initialisations, of which four
+concern members 4.14.190 does not have (get_report_spinlock, get_queue,
+get_id_queue, report_list — grep count 0 each). The five that exist are
+moved. write_pending and req stay in bind; they are genuinely per-bind,
+exactly as upstream leaves them.
+
+Beyond upstream, deliberately: the two per-bind stores are now taken
+under write_spinlock. Today they are unlocked stores to lock-protected
+fields, which is masked because the lock is re-initialised immediately
+above them. Once the lock becomes persistent that mask is gone and the
+race is real: a writer blocked in f_hidg_write()'s WRITE_COND loop on an
+fd that survived unbind — which 7b96ece4a deliberately makes possible —
+can take the lock, pass the check, and read hidg->req while bind stores
+NULL to it outside the lock. The re-check at the copy_from_user() site
+comes after the dereference.
+
+Verified: unpatched control object built first in an isolated out dir,
+its .text byte-identical to the shipped v6 f_hid.o (3f1bbd83...), so the
+build environment reproduces the running kernel; patched .text then
+differs (d04c6f0f...); compiles rc=0 with zero warnings; both
+__init_waitqueue_head relocations move out of hidg_bind into hidg_alloc.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013ydNrFirMZjskYMZST87ez
+---
+ drivers/usb/gadget/function/f_hid.c | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/usb/gadget/function/f_hid.c b/drivers/usb/gadget/function/f_hid.c
+index 5d73d6ed0..f544d1d8d 100644
+--- a/drivers/usb/gadget/function/f_hid.c
++++ b/drivers/usb/gadget/function/f_hid.c
+@@ -758,6 +758,7 @@ static int hidg_bind(struct usb_configuration *c, struct usb_function *f)
+ 	struct usb_ep		*ep;
+ 	struct f_hidg		*hidg = func_to_hidg(f);
+ 	struct usb_string	*us;
++	unsigned long		flags;
+ 	int			status;
+ 
+ 	/* maybe allocate device-global string IDs, and patch descriptors */
+@@ -822,13 +823,10 @@ static int hidg_bind(struct usb_configuration *c, struct usb_function *f)
+ 	if (status)
+ 		goto fail;
+ 
+-	spin_lock_init(&hidg->write_spinlock);
++	spin_lock_irqsave(&hidg->write_spinlock, flags);
+ 	hidg->write_pending = 1;
+ 	hidg->req = NULL;
+-	spin_lock_init(&hidg->read_spinlock);
+-	init_waitqueue_head(&hidg->write_queue);
+-	init_waitqueue_head(&hidg->read_queue);
+-	INIT_LIST_HEAD(&hidg->completed_out_req);
++	spin_unlock_irqrestore(&hidg->write_spinlock, flags);
+ 
+ 	/* create char device */
+ 	cdev_init(&hidg->cdev, &f_hidg_fops);
+@@ -1091,6 +1089,12 @@ static struct usb_function *hidg_alloc(struct usb_function_instance *fi)
+ 	if (!hidg)
+ 		return ERR_PTR(-ENOMEM);
+ 
++	spin_lock_init(&hidg->write_spinlock);
++	spin_lock_init(&hidg->read_spinlock);
++	init_waitqueue_head(&hidg->write_queue);
++	init_waitqueue_head(&hidg->read_queue);
++	INIT_LIST_HEAD(&hidg->completed_out_req);
++
+ 	opts = container_of(fi, struct f_hid_opts, func_inst);
+ 
+ 	mutex_lock(&opts->lock);
