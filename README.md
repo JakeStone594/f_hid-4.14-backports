@@ -4,8 +4,14 @@ Three fixes to `drivers/usb/gadget/function/f_hid.c`, carried by hand to a 4.14.
 kernel and verified on the device they run on.
 
 **4.14 is end-of-life.** No stable backport exists for any of these, and none is coming. That is the
-whole reason this repository exists: the device is mine, it runs a kernel nobody maintains, and one
-of these defects was resetting it.
+whole reason this repository exists: the device is mine, and one of these defects was resetting it.
+
+To be precise about who maintains what: the NetHunter tree this is built from
+([`AzeAstro/samsung_kernel_sm7125`](https://github.com/AzeAstro/samsung_kernel_sm7125), branch
+`OneUI-6`) *is* actively maintained, and that work is not in question here. But it is device and
+NetHunter enablement — the base stays pinned at Samsung's 4.14.190 vendor drop. Nobody is carrying
+4.14.y stable security fixes down into it, and Samsung is not shipping them either. That gap is
+what these three patches sit in.
 
 ## What I did, and what I did not do
 
