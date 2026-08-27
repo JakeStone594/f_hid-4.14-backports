@@ -10,8 +10,9 @@ To be precise about who maintains what: the NetHunter tree this is built from
 ([`AzeAstro/samsung_kernel_sm7125`](https://github.com/AzeAstro/samsung_kernel_sm7125), branch
 `OneUI-6`) *is* actively maintained, and that work is not in question here. But it is device and
 NetHunter enablement — the base stays pinned at Samsung's 4.14.190 vendor drop. Nobody is carrying
-4.14.y stable security fixes down into it, and Samsung is not shipping them either. That gap is
-what these three patches sit in.
+4.14.y stable security fixes down into it, and Samsung is not shipping them either — 4.14.y itself
+ended at 4.14.336 on 10 January 2024, and the series is no longer listed among kernel.org's
+supported releases. That gap is what these three patches sit in.
 
 ## What I did, and what I did not do
 
